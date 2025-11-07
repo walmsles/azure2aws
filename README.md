@@ -40,9 +40,22 @@ azure2aws https://myapps.microsoft.com/signin/AWS/xxxxx my-profile
 
 ## Requirements
 
-- macOS or Linux
-- Chrome browser
-- Go 1.19+ (for building from source)
+### System Requirements
+- **Operating System**: macOS, Linux, or Windows
+- **Browser**: Google Chrome or Chromium (required)
+- **Go**: 1.19+ (for building from source only)
+
+### Browser Support
+- ✅ **Chrome/Chromium**: Full support via DevTools Protocol
+- ❌ **Firefox**: Not supported
+- ❌ **Safari**: Not supported  
+- ❌ **Edge**: Not supported
+
+### Constraints
+- Chrome must be installed and accessible in standard locations
+- Tool launches Chrome with debugging enabled on a random port
+- Requires network access to Azure AD and AWS endpoints
+- Creates temporary Chrome profile for isolation
 
 ## Test your credentials
 
