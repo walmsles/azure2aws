@@ -24,6 +24,8 @@ import (
 	"gopkg.in/ini.v1"
 )
 
+var version = "dev"
+
 // SAML Response structures
 type SAMLResponse struct {
 	XMLName   xml.Name  `xml:"Response"`
@@ -608,6 +610,11 @@ func promptProfileSelection() string {
 }
 
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
+		fmt.Printf("azure2aws version %s\n", version)
+		os.Exit(0)
+	}
+	
 	var azureURL string
 	
 	if len(os.Args) < 2 {
