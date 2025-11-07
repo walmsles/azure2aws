@@ -1,6 +1,6 @@
 module acn2aws
 
-go 1.21
+go 1.23.0
 
 require (
 	github.com/aws/aws-sdk-go-v2/config v1.26.1
@@ -22,5 +22,5 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.21.5 // indirect
 	github.com/aws/smithy-go v1.19.0 // indirect
 	github.com/stretchr/testify v1.11.1 // indirect
-	golang.org/x/net v0.17.0 // indirect
+	golang.org/x/net v0.38.0 // indirect
 )
