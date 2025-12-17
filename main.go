@@ -155,21 +155,20 @@ func (cd *ChromeDebugger) LaunchChrome(startURL string) error {
 		"--user-data-dir=" + userDataDir,
 		"--no-first-run",
 		"--no-default-browser-check",
-		"--disable-web-security",
-		"--disable-features=VizDisplayCompositor",
-		"--disable-extensions",
-		"--no-sandbox",
-		"--disable-dev-shm-usage",
-		"--disable-gpu",
-		"--headless=false", // Ensure it's not headless
 		startURL,
 	}
+
+	log.Printf("Chrome path: %s", chromePath)
+	log.Printf("Chrome args: %v", args)
+	log.Printf("User data dir: %s", userDataDir)
 
 	cd.cmd = exec.Command(chromePath, args...)
 
 	if err := cd.cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start Chrome: %w", err)
 	}
+
+	log.Printf("Chrome process started with PID: %d", cd.cmd.Process.Pid)
 
 	// Wait longer for Chrome to be ready and create page targets
 	time.Sleep(5 * time.Second)
@@ -393,6 +392,14 @@ func (cd *ChromeDebugger) SendCommand(method string, params map[string]interface
 func (cd *ChromeDebugger) EnableNetworkMonitoring() error {
 	// ONLY enable Network - no interception, no fetch, no blocking
 	return cd.SendCommand("Network.enable", nil)
+}
+
+// NavigateToURL navigates to the specified URL
+func (cd *ChromeDebugger) NavigateToURL(url string) error {
+	params := map[string]interface{}{
+		"url": url,
+	}
+	return cd.SendCommand("Page.navigate", params)
 }
 
 // extractSAMLFromPostData extracts SAML response from POST data
@@ -746,9 +753,25 @@ func main() {
 	}
 
 	fmt.Println("✓ Network monitoring enabled")
+
+	// Enable Page domain for navigation
+	fmt.Println("📄 Enabling Page domain...")
+	if err := debugger.SendCommand("Page.enable", nil); err != nil {
+		log.Printf("⚠️  Failed to enable Page domain: %v", err)
+	}
+
+	// Navigate to the URL explicitly
+	fmt.Println("🌐 Navigating to Azure URL...")
+	if err := debugger.NavigateToURL(azureURL); err != nil {
+		log.Printf("⚠️  Failed to navigate programmatically: %v", err)
+	} else {
+		fmt.Println("✓ Navigation initiated")
+	}
+
 	fmt.Println("\n" + strings.Repeat("─", 55))
-	fmt.Println("  Sign in to Azure AD in the Chrome window")
-	fmt.Println("  The browser should work normally")
+	fmt.Println("  📌 IMPORTANT: Check your dock for Chrome icon")
+	fmt.Println("  Click the Chrome icon to bring window to front")
+	fmt.Println("  Then sign in to Azure AD normally")
 	fmt.Println(strings.Repeat("─", 55))
 
 	// Wait for SAML
