@@ -41,7 +41,7 @@ type AttributeStatement struct {
 }
 
 type Attribute struct {
-	Name           string           `xml:"Name,attr"`
+	Name            string           `xml:"Name,attr"`
 	AttributeValues []AttributeValue `xml:"AttributeValue"`
 }
 
@@ -85,6 +85,22 @@ func NewChromeDebugger(debugPort int) *ChromeDebugger {
 		done:       make(chan struct{}),
 		requestIDs: make(map[string]bool),
 	}
+}
+
+// KillExistingChromeProcesses kills any existing Chrome processes with debugging enabled
+func KillExistingChromeProcesses(debugPort int) {
+	switch runtime.GOOS {
+	case "darwin":
+		// Kill Chrome processes with our debug port
+		exec.Command("pkill", "-f", fmt.Sprintf("remote-debugging-port=%d", debugPort)).Run()
+	case "linux":
+		exec.Command("pkill", "-f", fmt.Sprintf("remote-debugging-port=%d", debugPort)).Run()
+	case "windows":
+		exec.Command("taskkill", "/F", "/IM", "chrome.exe").Run()
+	}
+
+	// Wait a moment for processes to terminate
+	time.Sleep(2 * time.Second)
 }
 
 // GetChromePath finds Chrome executable path
@@ -139,6 +155,13 @@ func (cd *ChromeDebugger) LaunchChrome(startURL string) error {
 		"--user-data-dir=" + userDataDir,
 		"--no-first-run",
 		"--no-default-browser-check",
+		"--disable-web-security",
+		"--disable-features=VizDisplayCompositor",
+		"--disable-extensions",
+		"--no-sandbox",
+		"--disable-dev-shm-usage",
+		"--disable-gpu",
+		"--headless=false", // Ensure it's not headless
 		startURL,
 	}
 
@@ -148,59 +171,94 @@ func (cd *ChromeDebugger) LaunchChrome(startURL string) error {
 		return fmt.Errorf("failed to start Chrome: %w", err)
 	}
 
-	// Wait for Chrome to be ready
-	time.Sleep(3 * time.Second)
+	// Wait longer for Chrome to be ready and create page targets
+	time.Sleep(5 * time.Second)
 
 	return nil
 }
 
 // Connect connects to Chrome DevTools Protocol using Browser target
 func (cd *ChromeDebugger) Connect() error {
-	// Get all targets
-	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/json", cd.debugPort))
-	if err != nil {
-		return fmt.Errorf("failed to connect to Chrome: %w", err)
-	}
-	defer resp.Body.Close()
+	// Retry connection with backoff
+	maxRetries := 10
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		log.Printf("Connection attempt %d/%d...", attempt, maxRetries)
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read response: %w", err)
-	}
-
-	var targets []map[string]interface{}
-	if err := json.Unmarshal(body, &targets); err != nil {
-		return fmt.Errorf("failed to parse JSON: %w", err)
-	}
-
-	// Find the first page target
-	var wsURL string
-	for _, target := range targets {
-		targetType, _ := target["type"].(string)
-		if targetType == "page" {
-			wsURL, _ = target["webSocketDebuggerUrl"].(string)
-			break
+		// Get all targets
+		resp, err := http.Get(fmt.Sprintf("http://localhost:%d/json", cd.debugPort))
+		if err != nil {
+			if attempt == maxRetries {
+				return fmt.Errorf("failed to connect to Chrome after %d attempts: %w", maxRetries, err)
+			}
+			time.Sleep(time.Duration(attempt) * time.Second)
+			continue
 		}
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			if attempt == maxRetries {
+				return fmt.Errorf("failed to read response: %w", err)
+			}
+			time.Sleep(time.Duration(attempt) * time.Second)
+			continue
+		}
+
+		var targets []map[string]interface{}
+		if err := json.Unmarshal(body, &targets); err != nil {
+			if attempt == maxRetries {
+				return fmt.Errorf("failed to parse JSON: %w", err)
+			}
+			time.Sleep(time.Duration(attempt) * time.Second)
+			continue
+		}
+
+		log.Printf("Found %d targets", len(targets))
+
+		// Find the first page target
+		var wsURL string
+		for _, target := range targets {
+			targetType, _ := target["type"].(string)
+			targetURL, _ := target["url"].(string)
+			log.Printf("Target: type=%s, url=%s", targetType, targetURL)
+
+			if targetType == "page" {
+				wsURL, _ = target["webSocketDebuggerUrl"].(string)
+				break
+			}
+		}
+
+		if wsURL == "" {
+			if attempt == maxRetries {
+				return fmt.Errorf("no page target found after %d attempts", maxRetries)
+			}
+			log.Printf("No page target found, retrying in %d seconds...", attempt)
+			time.Sleep(time.Duration(attempt) * time.Second)
+			continue
+		}
+
+		cd.wsURL = wsURL
+
+		// Connect to WebSocket
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+		if err != nil {
+			if attempt == maxRetries {
+				return fmt.Errorf("failed to connect to WebSocket: %w", err)
+			}
+			time.Sleep(time.Duration(attempt) * time.Second)
+			continue
+		}
+
+		cd.conn = conn
+
+		// Start message reader
+		go cd.readMessages()
+
+		log.Printf("Successfully connected to Chrome DevTools Protocol")
+		return nil
 	}
 
-	if wsURL == "" {
-		return fmt.Errorf("no page target found")
-	}
-
-	cd.wsURL = wsURL
-
-	// Connect to WebSocket
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		return fmt.Errorf("failed to connect to WebSocket: %w", err)
-	}
-
-	cd.conn = conn
-
-	// Start message reader
-	go cd.readMessages()
-
-	return nil
+	return fmt.Errorf("failed to connect after %d attempts", maxRetries)
 }
 
 // readMessages reads messages from Chrome DevTools Protocol
@@ -247,7 +305,7 @@ func (cd *ChromeDebugger) handleMessage(msg map[string]interface{}) {
 		// Detect POST to AWS signin
 		if reqMethod == "POST" && strings.Contains(reqURL, "signin.aws.amazon.com") {
 			log.Printf("🔍 Detected POST to AWS: %s", reqURL)
-			
+
 			// Store request ID so we can fetch the body
 			cd.mu.Lock()
 			cd.requestIDs[requestID] = true
@@ -279,7 +337,7 @@ func (cd *ChromeDebugger) handleMessage(msg map[string]interface{}) {
 		}
 
 		requestID, _ := params["requestId"].(string)
-		
+
 		cd.mu.Lock()
 		shouldFetch := cd.requestIDs[requestID]
 		cd.mu.Unlock()
@@ -524,14 +582,14 @@ func getConfigDir() string {
 func saveLastURL(url string) {
 	configDir := getConfigDir()
 	os.MkdirAll(configDir, 0755)
-	
+
 	configFile := filepath.Join(configDir, "config")
 	file, err := os.Create(configFile)
 	if err != nil {
 		return
 	}
 	defer file.Close()
-	
+
 	fmt.Fprintf(file, "last_url=%s\n", url)
 }
 
@@ -542,7 +600,7 @@ func loadLastURL() string {
 	if err != nil {
 		return ""
 	}
-	
+
 	lines := strings.Split(string(data), "\n")
 	for _, line := range lines {
 		if strings.HasPrefix(line, "last_url=") {
@@ -558,13 +616,13 @@ func getExistingProfiles() []string {
 	if err != nil {
 		return []string{}
 	}
-	
+
 	credsFile := filepath.Join(homeDir, ".aws", "credentials")
 	cfg, err := ini.Load(credsFile)
 	if err != nil {
 		return []string{}
 	}
-	
+
 	var profiles []string
 	for _, section := range cfg.Sections() {
 		if section.Name() != "DEFAULT" {
@@ -577,17 +635,17 @@ func getExistingProfiles() []string {
 // promptProfileSelection prompts user to select or create a profile
 func promptProfileSelection() string {
 	profiles := getExistingProfiles()
-	
+
 	if len(profiles) > 0 {
 		fmt.Println("\n📋 Existing AWS profiles:")
 		for i, profile := range profiles {
 			fmt.Printf("%d. %s\n", i+1, profile)
 		}
-		
+
 		fmt.Printf("\nSelect profile (1-%d) or enter new name: ", len(profiles))
 		var input string
 		fmt.Scanln(&input)
-		
+
 		// Check if it's a number
 		var choice int
 		if n, err := fmt.Sscanf(input, "%d", &choice); n == 1 && err == nil {
@@ -595,7 +653,7 @@ func promptProfileSelection() string {
 				return profiles[choice-1]
 			}
 		}
-		
+
 		// Treat as new profile name
 		return input
 	} else {
@@ -614,9 +672,9 @@ func main() {
 		fmt.Printf("azure2aws version %s\n", version)
 		os.Exit(0)
 	}
-	
+
 	var azureURL string
-	
+
 	if len(os.Args) < 2 {
 		lastURL := loadLastURL()
 		if lastURL != "" {
@@ -637,10 +695,10 @@ func main() {
 	} else {
 		azureURL = os.Args[1]
 	}
-	
+
 	// Save the URL for next time
 	saveLastURL(azureURL)
-	
+
 	var profileName string
 	if len(os.Args) >= 3 {
 		profileName = os.Args[2]
@@ -656,6 +714,10 @@ func main() {
 	fmt.Printf("\n📁 Profile: %s\n", profileName)
 	fmt.Printf("🌐 Azure URL: %s\n", azureURL)
 
+	// Kill any existing Chrome processes to avoid conflicts
+	fmt.Println("\n🧹 Cleaning up existing Chrome processes...")
+	KillExistingChromeProcesses(debugPort)
+
 	// Create Chrome debugger
 	debugger := NewChromeDebugger(debugPort)
 	defer debugger.Close()
@@ -670,7 +732,7 @@ func main() {
 
 	// Connect to Chrome DevTools Protocol
 	fmt.Println("🔌 Connecting to Chrome DevTools Protocol...")
-	
+
 	if err := debugger.Connect(); err != nil {
 		log.Fatalf("❌ Failed to connect: %v", err)
 	}
@@ -691,7 +753,7 @@ func main() {
 
 	// Wait for SAML
 	fmt.Println("\n⏳ Waiting for SAML response... (timeout: 5 minutes)")
-	
+
 	samlResponse, err := debugger.WaitForSAML(5 * time.Minute)
 	if err != nil {
 		log.Fatalf("❌ %v", err)
