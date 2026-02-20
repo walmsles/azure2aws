@@ -1,6 +1,6 @@
 # azure2aws
 
-Authenticate to AWS using Azure AD SAML via Chrome automation.
+Authenticate to AWS using Azure AD SAML via browser automation.
 
 ## Installation
 
@@ -32,8 +32,8 @@ azure2aws https://myapps.microsoft.com/signin/AWS/xxxxx my-profile
 
 ## How it works
 
-1. Launches Chrome with debugging enabled
-2. Navigates to your Azure AD sign-in URL
+1. Detects an installed Chromium-based browser (Chrome, Edge, or Chromium)
+2. Launches the browser and navigates to your Azure AD sign-in URL
 3. You sign in normally in the browser
 4. Captures the SAML response automatically
 5. Extracts AWS credentials and saves to `~/.aws/credentials`
@@ -42,20 +42,23 @@ azure2aws https://myapps.microsoft.com/signin/AWS/xxxxx my-profile
 
 ### System Requirements
 - **Operating System**: macOS, Linux, or Windows
-- **Browser**: Google Chrome or Chromium (required)
-- **Go**: 1.19+ (for building from source only)
+- **Browser**: Google Chrome, Microsoft Edge, or Chromium
+- **Go**: 1.24+ (for building from source only)
 
 ### Browser Support
-- ✅ **Chrome/Chromium**: Full support via DevTools Protocol
-- ❌ **Firefox**: Not supported
-- ❌ **Safari**: Not supported  
-- ❌ **Edge**: Not supported
+
+Priority order when multiple browsers are installed: Chrome > Edge > Chromium.
+
+- ✅ **Google Chrome**: Full support
+- ✅ **Microsoft Edge**: Full support
+- ✅ **Chromium**: Full support
+- ❌ **Firefox**: Not supported (not Chromium-based)
+- ❌ **Safari**: Not supported (not Chromium-based)
 
 ### Constraints
-- Chrome must be installed and accessible in standard locations
-- Tool launches Chrome with debugging enabled on a random port
+- A supported browser must be installed in a standard location
+- Requires a graphical desktop (X11 or Wayland on Linux)
 - Requires network access to Azure AD and AWS endpoints
-- Creates temporary Chrome profile for isolation
 
 ## Test your credentials
 

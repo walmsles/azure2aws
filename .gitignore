@@ -1,0 +1,24 @@
+# Go build artifacts
+*.exe
+*.test
+*.out
+azure2aws
+
+# Go dependencies (if using vendor)
+vendor/
+
+# IDE and system files
+.DS_Store
+Thumbs.db
+*.tmp
+*.swp
+.vscode/
+.idea/
+
+# Environment and logs
+*.log
+.env*
+
+# Temporary directories
+tmp/
+temp/
