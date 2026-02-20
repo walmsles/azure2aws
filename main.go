@@ -3,24 +3,22 @@ package main
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"encoding/xml"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
-	"github.com/gorilla/websocket"
+	"github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/cdproto/target"
+	"github.com/chromedp/chromedp"
 	"gopkg.in/ini.v1"
 )
 
@@ -57,71 +55,41 @@ type AWSCredentials struct {
 	Expiration      time.Time
 }
 
-// ChromeDebugger manages Chrome DevTools Protocol connection
-type ChromeDebugger struct {
-	cmd          *exec.Cmd
-	wsURL        string
-	conn         *websocket.Conn
-	debugPort    int
-	samlResponse string
-	requestID    int
-	mu           sync.Mutex
-	done         chan struct{}
-	requestIDs   map[string]bool
-}
 
-// CDPMessage represents Chrome DevTools Protocol message
-type CDPMessage struct {
-	ID     int                    `json:"id"`
-	Method string                 `json:"method"`
-	Params map[string]interface{} `json:"params,omitempty"`
-}
 
-// NewChromeDebugger creates a new Chrome instance with debugging enabled
-func NewChromeDebugger(debugPort int) *ChromeDebugger {
-	return &ChromeDebugger{
-		debugPort:  debugPort,
-		requestID:  1,
-		done:       make(chan struct{}),
-		requestIDs: make(map[string]bool),
-	}
-}
-
-// KillExistingChromeProcesses kills any existing Chrome processes with debugging enabled
-func KillExistingChromeProcesses(debugPort int) {
-	switch runtime.GOOS {
-	case "darwin":
-		// Kill Chrome processes with our debug port
-		exec.Command("pkill", "-f", fmt.Sprintf("remote-debugging-port=%d", debugPort)).Run()
-	case "linux":
-		exec.Command("pkill", "-f", fmt.Sprintf("remote-debugging-port=%d", debugPort)).Run()
-	case "windows":
-		exec.Command("taskkill", "/F", "/IM", "chrome.exe").Run()
-	}
-
-	// Wait a moment for processes to terminate
-	time.Sleep(2 * time.Second)
-}
-
-// GetChromePath finds Chrome executable path
-func GetChromePath() string {
+// GetBrowserPath finds browser executable path (Chrome > Edge > Chromium)
+func GetBrowserPath() (string, error) {
 	paths := []string{}
 
 	switch runtime.GOOS {
 	case "darwin":
 		paths = []string{
+			// Chrome first
 			"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+			// Edge second
+			"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+			// Chromium last
 			"/Applications/Chromium.app/Contents/MacOS/Chromium",
 		}
 	case "windows":
 		paths = []string{
+			// Chrome first
 			"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
 			"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
 			os.Getenv("LOCALAPPDATA") + "\\Google\\Chrome\\Application\\chrome.exe",
+			// Edge second
+			"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+			"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+			os.Getenv("LOCALAPPDATA") + "\\Microsoft\\Edge\\Application\\msedge.exe",
 		}
 	case "linux":
 		paths = []string{
+			// Chrome first
 			"/usr/bin/google-chrome",
+			// Edge second
+			"/usr/bin/microsoft-edge",
+			"/usr/bin/microsoft-edge-stable",
+			// Chromium last
 			"/usr/bin/chromium",
 			"/usr/bin/chromium-browser",
 			"/snap/bin/chromium",
@@ -130,280 +98,43 @@ func GetChromePath() string {
 
 	for _, path := range paths {
 		if _, err := os.Stat(path); err == nil {
-			return path
+			return path, nil
 		}
 	}
 
-	return ""
+	// Build error message with platform-specific browser list
+	var browserList string
+	switch runtime.GOOS {
+	case "darwin":
+		browserList = "Google Chrome, Microsoft Edge, or Chromium"
+	case "windows":
+		browserList = "Google Chrome, Microsoft Edge"
+	case "linux":
+		browserList = "Google Chrome, Microsoft Edge, or Chromium"
+	default:
+		browserList = "a Chromium-based browser"
+	}
+
+	searchedPaths := strings.Join(paths, "\n  ")
+	return "", fmt.Errorf("no supported browser found. Install one of: %s.\nSearched paths:\n  %s", browserList, searchedPaths)
 }
 
-// LaunchChrome starts Chrome with remote debugging enabled
-func (cd *ChromeDebugger) LaunchChrome(startURL string) error {
-	chromePath := GetChromePath()
-	if chromePath == "" {
-		return fmt.Errorf("Chrome executable not found")
-	}
 
-	// Create user data directory
-	userDataDir, err := os.MkdirTemp("", "chrome-debug-*")
-	if err != nil {
-		return fmt.Errorf("failed to create temp dir: %w", err)
-	}
-
-	args := []string{
-		fmt.Sprintf("--remote-debugging-port=%d", cd.debugPort),
-		"--user-data-dir=" + userDataDir,
-		"--no-first-run",
-		"--no-default-browser-check",
-		startURL,
-	}
-
-	log.Printf("Chrome path: %s", chromePath)
-	log.Printf("Chrome args: %v", args)
-	log.Printf("User data dir: %s", userDataDir)
-
-	cd.cmd = exec.Command(chromePath, args...)
-
-	if err := cd.cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start Chrome: %w", err)
-	}
-
-	log.Printf("Chrome process started with PID: %d", cd.cmd.Process.Pid)
-
-	// Wait longer for Chrome to be ready and create page targets
-	time.Sleep(5 * time.Second)
-
-	return nil
-}
-
-// Connect connects to Chrome DevTools Protocol using Browser target
-func (cd *ChromeDebugger) Connect() error {
-	// Retry connection with backoff
-	maxRetries := 10
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		log.Printf("Connection attempt %d/%d...", attempt, maxRetries)
-
-		// Get all targets
-		resp, err := http.Get(fmt.Sprintf("http://localhost:%d/json", cd.debugPort))
-		if err != nil {
-			if attempt == maxRetries {
-				return fmt.Errorf("failed to connect to Chrome after %d attempts: %w", maxRetries, err)
-			}
-			time.Sleep(time.Duration(attempt) * time.Second)
-			continue
-		}
-		defer resp.Body.Close()
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			if attempt == maxRetries {
-				return fmt.Errorf("failed to read response: %w", err)
-			}
-			time.Sleep(time.Duration(attempt) * time.Second)
-			continue
-		}
-
-		var targets []map[string]interface{}
-		if err := json.Unmarshal(body, &targets); err != nil {
-			if attempt == maxRetries {
-				return fmt.Errorf("failed to parse JSON: %w", err)
-			}
-			time.Sleep(time.Duration(attempt) * time.Second)
-			continue
-		}
-
-		log.Printf("Found %d targets", len(targets))
-
-		// Find the first page target
-		var wsURL string
-		for _, target := range targets {
-			targetType, _ := target["type"].(string)
-			targetURL, _ := target["url"].(string)
-			log.Printf("Target: type=%s, url=%s", targetType, targetURL)
-
-			if targetType == "page" {
-				wsURL, _ = target["webSocketDebuggerUrl"].(string)
-				break
-			}
-		}
-
-		if wsURL == "" {
-			if attempt == maxRetries {
-				return fmt.Errorf("no page target found after %d attempts", maxRetries)
-			}
-			log.Printf("No page target found, retrying in %d seconds...", attempt)
-			time.Sleep(time.Duration(attempt) * time.Second)
-			continue
-		}
-
-		cd.wsURL = wsURL
-
-		// Connect to WebSocket
-		conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-		if err != nil {
-			if attempt == maxRetries {
-				return fmt.Errorf("failed to connect to WebSocket: %w", err)
-			}
-			time.Sleep(time.Duration(attempt) * time.Second)
-			continue
-		}
-
-		cd.conn = conn
-
-		// Start message reader
-		go cd.readMessages()
-
-		log.Printf("Successfully connected to Chrome DevTools Protocol")
-		return nil
-	}
-
-	return fmt.Errorf("failed to connect after %d attempts", maxRetries)
-}
 
 // readMessages reads messages from Chrome DevTools Protocol
-func (cd *ChromeDebugger) readMessages() {
-	defer close(cd.done)
-	for {
-		_, message, err := cd.conn.ReadMessage()
-		if err != nil {
-			return
-		}
-
-		var msg map[string]interface{}
-		if err := json.Unmarshal(message, &msg); err != nil {
-			continue
-		}
-
-		cd.handleMessage(msg)
-	}
-}
 
 // handleMessage processes incoming CDP messages
-func (cd *ChromeDebugger) handleMessage(msg map[string]interface{}) {
-	method, ok := msg["method"].(string)
-	if !ok {
-		return
-	}
-
-	// Handle network events - look for requests
-	if method == "Network.requestWillBeSent" {
-		params, ok := msg["params"].(map[string]interface{})
-		if !ok {
-			return
-		}
-
-		requestID, _ := params["requestId"].(string)
-		request, ok := params["request"].(map[string]interface{})
-		if !ok {
-			return
-		}
-
-		reqURL, _ := request["url"].(string)
-		reqMethod, _ := request["method"].(string)
-
-		// Detect POST to AWS signin
-		if reqMethod == "POST" && strings.Contains(reqURL, "signin.aws.amazon.com") {
-			log.Printf("🔍 Detected POST to AWS: %s", reqURL)
-
-			// Store request ID so we can fetch the body
-			cd.mu.Lock()
-			cd.requestIDs[requestID] = true
-			cd.mu.Unlock()
-
-			// Try to get POST data if available directly
-			if postData, ok := request["postData"].(string); ok && postData != "" {
-				log.Println("✓ Found POST data in request")
-				saml := cd.extractSAMLFromPostData(postData)
-				if saml != "" {
-					cd.mu.Lock()
-					cd.samlResponse = saml
-					cd.mu.Unlock()
-					log.Println("✓ SAML captured from POST data!")
-				}
-			} else {
-				// Request the post data explicitly
-				log.Println("📡 POST data not in request, trying to fetch...")
-				go cd.fetchPostData(requestID)
-			}
-		}
-	}
-
-	// Also check for response loading finished (backup method)
-	if method == "Network.loadingFinished" {
-		params, ok := msg["params"].(map[string]interface{})
-		if !ok {
-			return
-		}
-
-		requestID, _ := params["requestId"].(string)
-
-		cd.mu.Lock()
-		shouldFetch := cd.requestIDs[requestID]
-		cd.mu.Unlock()
-
-		if shouldFetch && cd.GetSAMLResponse() == "" {
-			go cd.fetchPostData(requestID)
-		}
-	}
-}
 
 // fetchPostData attempts to fetch POST data for a request
-func (cd *ChromeDebugger) fetchPostData(requestID string) {
-	// Send command to get post data
-	cd.mu.Lock()
-	id := cd.requestID
-	cd.requestID++
-	cd.mu.Unlock()
-
-	cmd := map[string]interface{}{
-		"id":     id,
-		"method": "Network.getRequestPostData",
-		"params": map[string]interface{}{
-			"requestId": requestID,
-		},
-	}
-
-	if err := cd.conn.WriteJSON(cmd); err != nil {
-		log.Printf("Failed to request post data: %v", err)
-		return
-	}
-
-	// Note: Response will come back in readMessages as a reply with matching id
-	// We'll need to handle it there, but for simplicity, we're relying on the direct method
-}
 
 // SendCommand sends a command to Chrome DevTools Protocol
-func (cd *ChromeDebugger) SendCommand(method string, params map[string]interface{}) error {
-	cd.mu.Lock()
-	id := cd.requestID
-	cd.requestID++
-	cd.mu.Unlock()
-
-	msg := CDPMessage{
-		ID:     id,
-		Method: method,
-		Params: params,
-	}
-
-	return cd.conn.WriteJSON(msg)
-}
 
 // EnableNetworkMonitoring enables ONLY passive network monitoring
-func (cd *ChromeDebugger) EnableNetworkMonitoring() error {
-	// ONLY enable Network - no interception, no fetch, no blocking
-	return cd.SendCommand("Network.enable", nil)
-}
 
 // NavigateToURL navigates to the specified URL
-func (cd *ChromeDebugger) NavigateToURL(url string) error {
-	params := map[string]interface{}{
-		"url": url,
-	}
-	return cd.SendCommand("Page.navigate", params)
-}
 
 // extractSAMLFromPostData extracts SAML response from POST data
-func (cd *ChromeDebugger) extractSAMLFromPostData(postData string) string {
+func extractSAMLFromPostData(postData string) string {
 	// Parse URL-encoded form data
 	values, err := url.ParseQuery(postData)
 	if err != nil {
@@ -425,46 +156,127 @@ func (cd *ChromeDebugger) extractSAMLFromPostData(postData string) string {
 	return values.Get("SAMLResponse")
 }
 
-// GetSAMLResponse returns the captured SAML response
-func (cd *ChromeDebugger) GetSAMLResponse() string {
-	cd.mu.Lock()
-	defer cd.mu.Unlock()
-	return cd.samlResponse
-}
+// runBrowserSession launches browser with chromedp and captures the SAML response
+func runBrowserSession(browserPath, url string, timeout time.Duration) (string, error) {
+	// Create channel for SAML response
+	samlCh := make(chan string, 1)
 
-// WaitForSAML waits for SAML response with timeout
-func (cd *ChromeDebugger) WaitForSAML(timeout time.Duration) (string, error) {
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
+	// Create allocator with the specified browser
+	allocCtx, allocCancel := chromedp.NewExecAllocator(
+		context.Background(),
+		chromedp.ExecPath(browserPath),
+		chromedp.Flag("headless", false),
+		chromedp.NoFirstRun,
+		chromedp.NoDefaultBrowserCheck,
+	)
+	defer allocCancel()
 
-	deadline := time.Now().Add(timeout)
+	// Create browser context
+	ctx, cancel := chromedp.NewContext(allocCtx)
+	defer cancel()
 
-	for {
+	// Set up network listener for SAML capture
+	chromedp.ListenTarget(ctx, func(ev interface{}) {
+		switch ev := ev.(type) {
+		case *network.EventRequestWillBeSent:
+			// Check if this is a POST to signin.aws.amazon.com
+			if ev.Request.Method == "POST" && strings.Contains(ev.Request.URL, "signin.aws.amazon.com") {
+				log.Println("✓ Detected POST to signin.aws.amazon.com")
+
+				// Try inline POST data entries first (Bytes field is base64-encoded)
+				if ev.Request.HasPostData && len(ev.Request.PostDataEntries) > 0 {
+					var rawData []byte
+					for _, entry := range ev.Request.PostDataEntries {
+						decoded, err := base64.StdEncoding.DecodeString(entry.Bytes)
+						if err != nil {
+							// Not base64 — try using as raw text
+							rawData = append(rawData, []byte(entry.Bytes)...)
+						} else {
+							rawData = append(rawData, decoded...)
+						}
+					}
+					if len(rawData) > 0 {
+						if saml := extractSAMLFromPostData(string(rawData)); saml != "" {
+							select {
+							case samlCh <- saml:
+								log.Println("✓ SAML captured from inline POST data!")
+							default:
+							}
+							return
+						}
+					}
+				}
+
+				// Fall back to fetching POST data via CDP command
+				requestID := ev.RequestID
+				go func() {
+					c := chromedp.FromContext(ctx)
+					if c == nil || c.Target == nil {
+						return
+					}
+					data, err := network.GetRequestPostData(requestID).Do(cdp.WithExecutor(ctx, c.Target))
+					if err != nil {
+						log.Printf("⚠ Failed to fetch POST data: %v", err)
+						return
+					}
+					if saml := extractSAMLFromPostData(data); saml != "" {
+						select {
+						case samlCh <- saml:
+							log.Println("✓ SAML captured from fetched POST data!")
+						default:
+						}
+					}
+				}()
+			}
+		}
+	})
+
+	// Set up browser event listener to detect when browser is closed
+	browserClosed := make(chan struct{}, 1)
+	chromedp.ListenBrowser(ctx, func(ev interface{}) {
+		if _, ok := ev.(*target.EventTargetDestroyed); ok {
+			select {
+			case browserClosed <- struct{}{}:
+			default:
+			}
+		}
+	})
+
+	// Enable network monitoring and navigate to URL
+	log.Printf("Navigating to: %s", url)
+	log.Println("Please complete the authentication in the browser window...")
+
+	err := chromedp.Run(ctx,
+		network.Enable().WithMaxPostDataSize(1 << 20), // 1MB max post data
+		chromedp.Navigate(url),
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to navigate to URL: %w", err)
+	}
+
+	// Wait for SAML response, timeout, or browser close
+	select {
+	case saml := <-samlCh:
+		return saml, nil
+	case <-time.After(timeout):
+		return "", fmt.Errorf("timeout waiting for SAML response after %v", timeout)
+	case <-browserClosed:
+		// Give a brief window for SAML to arrive (it may have been
+		// sent just before the tab was destroyed by AWS redirect)
 		select {
-		case <-cd.done:
-			return "", fmt.Errorf("connection closed")
-		case <-ticker.C:
-			saml := cd.GetSAMLResponse()
-			if saml != "" {
-				return saml, nil
-			}
-			if time.Now().After(deadline) {
-				return "", fmt.Errorf("timeout waiting for SAML response")
-			}
+		case saml := <-samlCh:
+			return saml, nil
+		case <-time.After(2 * time.Second):
+			return "", fmt.Errorf("browser was closed before authentication completed. Please run the tool again and complete the Azure AD sign-in")
 		}
 	}
 }
 
+// GetSAMLResponse returns the captured SAML response
+
+// WaitForSAML waits for SAML response with timeout
+
 // Close closes the Chrome instance and connection
-func (cd *ChromeDebugger) Close() {
-	if cd.conn != nil {
-		cd.conn.Close()
-	}
-	if cd.cmd != nil && cd.cmd.Process != nil {
-		cd.cmd.Process.Kill()
-		cd.cmd.Wait()
-	}
-}
 
 // ParseSAMLResponse parses the SAML response and extracts AWS roles
 func ParseSAMLResponse(samlResponseB64 string) ([]string, error) {
@@ -713,71 +525,36 @@ func main() {
 		profileName = promptProfileSelection()
 	}
 
-	debugPort := 9222
-
 	fmt.Println("═══════════════════════════════════════════════════════")
 	fmt.Println("   AWS SAML Authentication (Chrome CDP)")
 	fmt.Println("═══════════════════════════════════════════════════════")
 	fmt.Printf("\n📁 Profile: %s\n", profileName)
 	fmt.Printf("🌐 Azure URL: %s\n", azureURL)
 
-	// Kill any existing Chrome processes to avoid conflicts
-	fmt.Println("\n🧹 Cleaning up existing Chrome processes...")
-	KillExistingChromeProcesses(debugPort)
-
-	// Create Chrome debugger
-	debugger := NewChromeDebugger(debugPort)
-	defer debugger.Close()
-
-	// Launch Chrome
-	fmt.Println("\n🚀 Launching Chrome...")
-	if err := debugger.LaunchChrome(azureURL); err != nil {
-		log.Fatalf("❌ Failed to launch Chrome: %v", err)
+	// Check for display on Linux
+	if runtime.GOOS == "linux" {
+		if os.Getenv("DISPLAY") == "" && os.Getenv("WAYLAND_DISPLAY") == "" {
+			log.Fatal("❌ Cannot open browser: no display environment detected. This tool requires a graphical desktop (X11 or Wayland).")
+		}
 	}
 
-	fmt.Println("✓ Chrome launched")
-
-	// Connect to Chrome DevTools Protocol
-	fmt.Println("🔌 Connecting to Chrome DevTools Protocol...")
-
-	if err := debugger.Connect(); err != nil {
-		log.Fatalf("❌ Failed to connect: %v", err)
+	// Get browser path
+	browserPath, err := GetBrowserPath()
+	if err != nil {
+		log.Fatalf("❌ %v", err)
 	}
 
-	fmt.Println("✓ Connected")
-
-	// Enable ONLY passive network monitoring
-	fmt.Println("📡 Enabling network monitoring (passive only)...")
-	if err := debugger.EnableNetworkMonitoring(); err != nil {
-		log.Fatalf("❌ Failed to enable network monitoring: %v", err)
-	}
-
-	fmt.Println("✓ Network monitoring enabled")
-
-	// Enable Page domain for navigation
-	fmt.Println("📄 Enabling Page domain...")
-	if err := debugger.SendCommand("Page.enable", nil); err != nil {
-		log.Printf("⚠️  Failed to enable Page domain: %v", err)
-	}
-
-	// Navigate to the URL explicitly
-	fmt.Println("🌐 Navigating to Azure URL...")
-	if err := debugger.NavigateToURL(azureURL); err != nil {
-		log.Printf("⚠️  Failed to navigate programmatically: %v", err)
-	} else {
-		fmt.Println("✓ Navigation initiated")
-	}
-
+	// Launch browser and capture SAML
+	fmt.Println("\n🚀 Launching browser...")
 	fmt.Println("\n" + strings.Repeat("─", 55))
-	fmt.Println("  📌 IMPORTANT: Check your dock for Chrome icon")
-	fmt.Println("  Click the Chrome icon to bring window to front")
+	fmt.Println("  📌 IMPORTANT: Check your dock for browser icon")
+	fmt.Println("  Click the browser icon to bring window to front")
 	fmt.Println("  Then sign in to Azure AD normally")
 	fmt.Println(strings.Repeat("─", 55))
 
-	// Wait for SAML
 	fmt.Println("\n⏳ Waiting for SAML response... (timeout: 5 minutes)")
 
-	samlResponse, err := debugger.WaitForSAML(5 * time.Minute)
+	samlResponse, err := runBrowserSession(browserPath, azureURL, 5*time.Minute)
 	if err != nil {
 		log.Fatalf("❌ %v", err)
 	}
