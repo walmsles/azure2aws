@@ -183,43 +183,47 @@ func runBrowserSession(browserPath, url string, timeout time.Duration) (string, 
 			if ev.Request.Method == "POST" && strings.Contains(ev.Request.URL, "signin.aws.amazon.com") {
 				log.Println("✓ Detected POST to signin.aws.amazon.com")
 
-				// Check for inline POST data first
-				if ev.Request.HasPostData && ev.Request.PostDataEntries != nil && len(ev.Request.PostDataEntries) > 0 {
-					// Concatenate all post data entries
-					var postData strings.Builder
+				// Try inline POST data entries first (Bytes field is base64-encoded)
+				if ev.Request.HasPostData && len(ev.Request.PostDataEntries) > 0 {
+					var rawData []byte
 					for _, entry := range ev.Request.PostDataEntries {
-						postData.WriteString(entry.Bytes)
-					}
-
-					if saml := extractSAMLFromPostData(postData.String()); saml != "" {
-						select {
-						case samlCh <- saml:
-							log.Println("✓ SAML captured from inline POST data!")
-						default:
+						decoded, err := base64.StdEncoding.DecodeString(entry.Bytes)
+						if err != nil {
+							// Not base64 — try using as raw text
+							rawData = append(rawData, []byte(entry.Bytes)...)
+						} else {
+							rawData = append(rawData, decoded...)
 						}
-						return
+					}
+					if len(rawData) > 0 {
+						if saml := extractSAMLFromPostData(string(rawData)); saml != "" {
+							select {
+							case samlCh <- saml:
+								log.Println("✓ SAML captured from inline POST data!")
+							default:
+							}
+							return
+						}
 					}
 				}
 
-				// Fall back to fetching POST data separately
+				// Fall back to fetching POST data via CDP command
+				requestID := ev.RequestID
 				go func() {
-					// Need to get the post data using the request ID
-					var postData string
-					err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-						data, err := network.GetRequestPostData(ev.RequestID).Do(cdp.WithExecutor(ctx, chromedp.FromContext(ctx).Target))
-						if err == nil {
-							postData = data
-						}
-						return err
-					}))
-
-					if err == nil && postData != "" {
-						if saml := extractSAMLFromPostData(postData); saml != "" {
-							select {
-							case samlCh <- saml:
-								log.Println("✓ SAML captured from fetched POST data!")
-							default:
-							}
+					c := chromedp.FromContext(ctx)
+					if c == nil || c.Target == nil {
+						return
+					}
+					data, err := network.GetRequestPostData(requestID).Do(cdp.WithExecutor(ctx, c.Target))
+					if err != nil {
+						log.Printf("⚠ Failed to fetch POST data: %v", err)
+						return
+					}
+					if saml := extractSAMLFromPostData(data); saml != "" {
+						select {
+						case samlCh <- saml:
+							log.Println("✓ SAML captured from fetched POST data!")
+						default:
 						}
 					}
 				}()
@@ -228,10 +232,13 @@ func runBrowserSession(browserPath, url string, timeout time.Duration) (string, 
 	})
 
 	// Set up browser event listener to detect when browser is closed
+	browserClosed := make(chan struct{}, 1)
 	chromedp.ListenBrowser(ctx, func(ev interface{}) {
 		if _, ok := ev.(*target.EventTargetDestroyed); ok {
-			// Browser window was closed
-			cancel()
+			select {
+			case browserClosed <- struct{}{}:
+			default:
+			}
 		}
 	})
 
@@ -247,14 +254,21 @@ func runBrowserSession(browserPath, url string, timeout time.Duration) (string, 
 		return "", fmt.Errorf("failed to navigate to URL: %w", err)
 	}
 
-	// Wait for SAML response, timeout, or context cancellation
+	// Wait for SAML response, timeout, or browser close
 	select {
 	case saml := <-samlCh:
 		return saml, nil
 	case <-time.After(timeout):
 		return "", fmt.Errorf("timeout waiting for SAML response after %v", timeout)
-	case <-ctx.Done():
-		return "", fmt.Errorf("browser was closed before authentication completed. Please run the tool again and complete the Azure AD sign-in")
+	case <-browserClosed:
+		// Give a brief window for SAML to arrive (it may have been
+		// sent just before the tab was destroyed by AWS redirect)
+		select {
+		case saml := <-samlCh:
+			return saml, nil
+		case <-time.After(2 * time.Second):
+			return "", fmt.Errorf("browser was closed before authentication completed. Please run the tool again and complete the Azure AD sign-in")
+		}
 	}
 }
 
